@@ -2,8 +2,8 @@ name: Scrape fuel prices
 
 on:
   schedule:
-    - cron: "0 */3 * * *"    # every 3 hours
-  workflow_dispatch:           # run manually anytime
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
 
 jobs:
   scrape:
