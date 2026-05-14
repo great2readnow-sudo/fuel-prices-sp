@@ -1,117 +1,27 @@
-import httpx
-import psycopg2
-import os
-from datetime import datetime
+name: Scrape fuel prices
 
-def get_db():
-    return psycopg2.connect(os.environ["DATABASE_URL"], sslmode="require")
+on:
+  schedule:
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
 
-def scrape_and_save():
-    print(f"Scraping at {datetime.now()}")
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
 
-    # Official CNE API endpoint
-    try:
-        response = httpx.get(
-            "https://api.cne.cl/v1/precio/combustibles/estaciones",
-            timeout=30,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "application/json"
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
-    except Exception as e:
-        print(f"Failed to fetch API: {e}")
-        return
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    # API returns a list of stations with prices
-    stations = data if isinstance(data, list) else data.get("data", data.get("estaciones", []))
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-    if not stations:
-        print(f"No stations found. Response keys: {data.keys() if isinstance(data, dict) else 'list was empty'}")
-        return
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-    print(f"Found {len(stations)} stations")
-
-    conn = get_db()
-    cur  = conn.cursor()
-
-    price_totals = {}
-    region_data  = {}
-    saved = 0
-
-    for station in stations:
-        # Adjust field names based on actual API response
-        name      = station.get("razon_social") or station.get("nombre") or station.get("name", "")
-        region    = station.get("region", "")
-        commune   = station.get("comuna") or station.get("commune", "")
-        lat       = station.get("latitud") or station.get("lat")
-        lng       = station.get("longitud") or station.get("lng")
-        brand     = station.get("distribuidor") or station.get("brand", "")
-
-        if not name:
-            continue
-
-        station_id = name.lower().replace(" ", "-").replace("/", "-")[:100]
-
-        # Save station
-        cur.execute("""
-            INSERT INTO stations (id, name, region, commune, brand)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (id) DO NOTHING
-        """, (station_id, name, region, commune, brand))
-
-        # Each station has multiple fuel prices
-        precios = station.get("precios") or station.get("combustibles") or station.get("prices", [])
-
-        for precio in precios:
-            fuel_type = precio.get("tipo_combustible") or precio.get("combustible") or precio.get("type", "")
-            raw_price = precio.get("precio") or precio.get("price") or precio.get("valor", 0)
-
-            try:
-                price = int(float(str(raw_price).replace(".", "").replace(",", ".")))
-            except (ValueError, TypeError):
-                continue
-
-            if price <= 0:
-                continue
-
-            cur.execute("""
-                INSERT INTO prices (station_id, fuel_type, price)
-                VALUES (%s, %s, %s)
-            """, (station_id, fuel_type, price))
-
-            price_totals.setdefault(fuel_type, []).append(price)
-            region_data.setdefault(region, []).append(price)
-            saved += 1
-
-    # Save national averages
-    for fuel_type, prices in price_totals.items():
-        cur.execute("""
-            INSERT INTO averages (fuel_type, price, updated_at)
-            VALUES (%s, %s, NOW())
-            ON CONFLICT (fuel_type) DO UPDATE
-            SET price = EXCLUDED.price, updated_at = NOW()
-        """, (fuel_type, int(sum(prices)/len(prices))))
-
-    # Save region summaries
-    for region, prices in region_data.items():
-        if not region:
-            continue
-        cur.execute("""
-            INSERT INTO regions (region, min_price, avg_price, station_count, updated_at)
-            VALUES (%s, %s, %s, %s, NOW())
-            ON CONFLICT (region) DO UPDATE
-            SET min_price=EXCLUDED.min_price,
-                avg_price=EXCLUDED.avg_price,
-                station_count=EXCLUDED.station_count,
-                updated_at=NOW()
-        """, (region, min(prices), int(sum(prices)/len(prices)), len(prices)))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-    print(f"Done — {saved} price records saved across {len(price_totals)} fuel types, {len(region_data)} regions")
-
-scrape_and_save()
+      - name: Run scraper
+        run: python scraper.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
